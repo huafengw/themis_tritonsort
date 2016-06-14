@@ -1,3 +1,7 @@
+MONITOR_PORT: 8091
+
+STAT_POLL_INTERVAL: 100000
+
 # Print header for status log messages
 CHANNEL_STATUS_HEADER: "[STATUS]"
 

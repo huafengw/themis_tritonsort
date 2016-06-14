@@ -194,8 +194,8 @@ def generate_graysort_inputs(
             command_args.append("-m")
 
         command_args.extend([
-                "-b%d" % (disk_data_offset), str(disk_Data_Size),
-                Destination_Filename])
+                "-b%d" % (disk_data_offset), str(disk_data_size),
+                destination_filename])
 
         options_str = ' '.join(('%s %s' % (k, v)
                                 for k, v in command_options.items()))
