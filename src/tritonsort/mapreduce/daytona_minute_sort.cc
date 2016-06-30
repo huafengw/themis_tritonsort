@@ -1134,6 +1134,11 @@ void deriveAdditionalParams(
     params.add<uint64_t>("ALIGNMENT.phase_zero.reader", alignmentMultiple);
   }
 
+  if (params.get<bool>("DIRECT_IO.phase_one.reader")) {
+    // Phase one reader should align buffers.
+    params.add<uint64_t>("ALIGNMENT.phase_one.reader", alignmentMultiple);
+  }
+
   if (params.get<bool>("DIRECT_IO.phase_one.writer")) {
     // Reducer comes before the writer.
     params.add<uint64_t>("ALIGNMENT.phase_one.reducer", alignmentMultiple);
