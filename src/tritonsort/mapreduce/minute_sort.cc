@@ -71,6 +71,26 @@ void executePhaseOne(
     params->get<std::string>("RECEIVER_PORT"), peers.size(), *params, phaseName,
     "sender", peers, peers, senderSockets, receiverSockets);
 
+  uint64_t localNodeID = params->get<uint64_t>("MYPEERID");
+  uint64_t numNodes = params->get<uint64_t>("NUM_PEERS");
+
+  IPList replicaSenderPeers;
+  for (uint64_t i = 1; i < numNodes; i++) {
+    // Replicate to consecutive nodes.
+    replicaSenderPeers.push_back(peers.at((localNodeID + i) % numNodes));
+  }
+
+  // Open TCP connections to replica nodes.
+  uint64_t replicationLevel = params->get<uint64_t>("OUTPUT_REPLICATION_LEVEL");
+  SocketArray replicaSenderSockets;
+  SocketArray replicaReceiverSockets;
+  if (replicationLevel > 1) {
+    openAllSockets(
+      params->get<std::string>("REPLICA_RECEIVER_PORT"), numNodes - 1,
+      *params, phaseName, "replica_sender", replicaSenderPeers, peers,
+      replicaSenderSockets, replicaReceiverSockets);
+  }
+
   // Block until all nodes have connected TCP sockets.
   coordinatorClient->waitOnBarrier("sockets_connected");
   delete coordinatorClient;
@@ -99,6 +119,11 @@ void executePhaseOne(
   QuotaEnforcingWorkerTracker writerTracker(
     *params, phaseName, "writer", &queueingPolicyFactory);
 
+  QuotaEnforcingWorkerTracker replicaSenderTracker(
+    *params, phaseName, "replica_sender", &queueingPolicyFactory);
+  WorkerTracker replicaReceiverTracker(
+    *params, phaseName, "replica_receiver", &queueingPolicyFactory);
+
   MemoryQuota readerQuota(
     "reader_quota", params->get<uint64_t>("MEMORY_QUOTAS.phase_one.reader"));
   MemoryQuota readerConverterQuota(
@@ -117,6 +142,10 @@ void executePhaseOne(
   MemoryQuota reducerQuota(
     "reducer_quota", params->get<uint64_t>("MEMORY_QUOTAS.phase_one.reducer"));
 
+  MemoryQuota reducerReplicaQuota(
+    "reducer_replica_quota",
+    params->get<uint64_t>("MEMORY_QUOTAS.phase_one.reducer_replica"));
+
   readerConverterTracker.addProducerQuota(readerQuota);
   readerConverterTracker.addConsumerQuota(readerQuota);
   mapperTracker.addProducerQuota(readerConverterQuota);
@@ -132,6 +161,11 @@ void executePhaseOne(
   writerTracker.addProducerQuota(reducerQuota);
   writerTracker.addConsumerQuota(reducerQuota);
 
+  if (replicationLevel > 1) {
+    replicaSenderTracker.addProducerQuota(reducerReplicaQuota);
+    replicaSenderTracker.addConsumerQuota(reducerReplicaQuota);
+  }
+
   TrackerSet phaseOneTrackers;
   phaseOneTrackers.addTracker(&readerTracker, true);
   phaseOneTrackers.addTracker(&readerConverterTracker);
@@ -143,6 +177,11 @@ void executePhaseOne(
   phaseOneTrackers.addTracker(&reducerTracker);
   phaseOneTrackers.addTracker(&writerTracker);
 
+  if (replicationLevel > 1) {
+    phaseOneTrackers.addTracker(&replicaSenderTracker);
+    phaseOneTrackers.addTracker(&replicaReceiverTracker, true);
+  }
+
   readerTracker.isSourceTracker();
   readerTracker.addDownstreamTracker(&readerConverterTracker);
   readerConverterTracker.addDownstreamTracker(&mapperTracker);
@@ -153,6 +192,12 @@ void executePhaseOne(
   tupleDemuxTracker.addDownstreamTracker(&sorterTracker);
   sorterTracker.addDownstreamTracker(&reducerTracker);
   reducerTracker.addDownstreamTracker(&writerTracker);
+
+  if (replicationLevel > 1) {
+    reducerTracker.addDownstreamTracker(&replicaSenderTracker);
+    replicaReceiverTracker.isSourceTracker();
+    replicaReceiverTracker.addDownstreamTracker(&writerTracker);
+  }
 
   // Make sure the reader tracker gets its read requests.
   loadReadRequests(readerTracker, *params, phaseName);
@@ -180,6 +225,12 @@ void executePhaseOne(
   reducerTracker.setFactory(&workerFactory, "mapreduce", "reducer");
   writerTracker.setFactory(&workerFactory, "mapreduce", "writer");
 
+  replicaSenderTracker.setFactory(
+    &workerFactory, "mapreduce", "kv_pair_buf_sender");
+  replicaReceiverTracker.setFactory(
+    &workerFactory, "mapreduce", "kv_pair_buf_receiver");
+
+
   // Set up resources
   ABORT_IF(intermediateDiskList.size() == 0, "Must specify more than one "
            "intermediate directory");
@@ -205,6 +256,11 @@ void executePhaseOne(
 
   workerFactory.addDependency(
     "output_disk_list", const_cast<StringList*>(&intermediateDiskList));
+
+  workerFactory.addDependency(
+    "replica_sender", "sockets", &replicaSenderSockets);
+  workerFactory.addDependency(
+    "replica_receiver", "sockets", &replicaReceiverSockets);
 
   // Create workers
   phaseOneTrackers.createWorkers();

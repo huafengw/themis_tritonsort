@@ -77,7 +77,7 @@ void TupleDemux::run(KVPairBuffer* buffer) {
     writer = new PartialKVPairWriter(
       boost::bind(&TupleDemux::emitBuffer, this, _1, _2),
       boost::bind(&TupleDemux::newBuffer, this),
-      serializeWithoutHeaders, !minutesort);
+      serializeWithoutHeaders, false);
 
     // Instruct the writer to use the partition function local to this partition
     // group.

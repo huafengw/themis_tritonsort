@@ -525,9 +525,6 @@ void executePhaseOne(
   sorterTracker.addDownstreamTracker(&reducerTracker);
   reducerTracker.addDownstreamTracker(&writerTracker);
 
-  // Escape hatch for large partitions.
-  tupleDemuxTracker.addDownstreamTracker(&writerTracker);
-
   if (replicationLevel > 1) {
     reducerTracker.addDownstreamTracker(&replicaSenderTracker);
     replicaReceiverTracker.isSourceTracker();
@@ -596,9 +593,6 @@ void executePhaseOne(
     "replica_sender", "sockets", &replicaSenderSockets);
   workerFactory.addDependency(
     "replica_receiver", "sockets", &replicaReceiverSockets);
-
-  bool minutesort = true;
-  workerFactory.addDependency("minutesort", &minutesort);
 
   // Create workers
   phaseOneTrackers.createWorkers();
@@ -1068,7 +1062,6 @@ void deriveAdditionalParams(
   uint64_t numOutputDisks = outputDiskList.size();
   params.add<uint64_t>("NUM_OUTPUT_DISKS.phase_zero", numIntermediateDisks);
   params.add<uint64_t>("NUM_OUTPUT_DISKS.phase_one", numIntermediateDisks);
-  params.add<uint64_t>("NUM_OUTPUT_DISKS.phase_two", numOutputDisks);
 
   uint64_t numPhaseOneWriters =
     params.get<uint64_t>("NUM_WORKERS.phase_one.writer");
@@ -1079,7 +1072,6 @@ void deriveAdditionalParams(
   params.add<uint64_t>(
     "DISKS_PER_WORKER.phase_one.writer",
     numIntermediateDisks / numPhaseOneWriters);
-
 
   // Phase three writes to intermediate disks for splitsort and output disks for
   // mergereduce
@@ -1103,13 +1095,13 @@ void deriveAdditionalParams(
     "DISKS_PER_WORKER.phase_three.mergereduce_writer",
     numOutputDisks / numMergeReduceWriters);
 
-
   // Use one partition group per demux.
   uint64_t numDemuxes = params.get<uint64_t>("NUM_WORKERS.phase_one.demux");
   params.add<uint64_t>("PARTITION_GROUPS_PER_NODE", numDemuxes);
   params.add<uint64_t>(
     "NUM_PARTITION_GROUPS", numDemuxes * params.get<uint64_t>("NUM_PEERS"));
 
+  // Set phase 0 and 1 format reader type
   params.add<std::string>(
     "FORMAT_READER.phase_zero",
     params.get<std::string>("MAP_INPUT_FORMAT_READER"));
@@ -1129,7 +1121,6 @@ void deriveAdditionalParams(
     params.add<bool>("DESERIALIZE_WITHOUT_HEADERS.phase_one.demux", true);
     // Reducer will serialize without headers to strip them from disk I/O.
     params.add<bool>("SERIALIZE_WITHOUT_HEADERS.phase_one.reducer", true);
-    params.add<bool>("SERIALIZE_WITHOUT_HEADERS.phase_three.reducer", true);
   }
 
   // Use only 90% of the available memory for the allocator
@@ -1138,9 +1129,9 @@ void deriveAdditionalParams(
 
   // Set alignment parameters:
   uint64_t alignmentMultiple = params.get<uint64_t>("ALIGNMENT_MULTIPLE");
-  if (params.get<bool>("DIRECT_IO.phase_one.reader")) {
-    // Phase one reader should align buffers.
-    params.add<uint64_t>("ALIGNMENT.phase_one.reader", alignmentMultiple);
+  if (params.get<bool>("DIRECT_IO.phase_zero.reader")) {
+    // Phase zero reader should align buffers.
+    params.add<uint64_t>("ALIGNMENT.phase_zero.reader", alignmentMultiple);
   }
 
   if (params.get<bool>("DIRECT_IO.phase_one.writer")) {
@@ -1174,11 +1165,23 @@ void deriveAdditionalParams(
       "ALIGNMENT.phase_three.mergereduce_writer", alignmentMultiple);
   }
 
-
   // Stages that use fixed-size buffers should use caching allocators.
+  // Phase 0 = reader
+  if (params.contains("CACHED_MEMORY.phase_zero.reader")) {
+    params.add<bool>("CACHING_ALLOCATOR.phase_zero.reader", true);
+  }
+
   // Phase one = reader and demux
   if (params.contains("CACHED_MEMORY.phase_one.reader")) {
     params.add<bool>("CACHING_ALLOCATOR.phase_one.reader", true);
+  }
+
+  if (params.contains("CACHED_MEMORY.phase_three.splitsort_reader")) {
+    params.add<bool>("CACHING_ALLOCATOR.phase_three.splitsort_reader", true);
+  }
+
+  if (params.contains("CACHED_MEMORY.phase_three.mergereduce_reader")) {
+    params.add<bool>("CACHING_ALLOCATOR.phase_three.mergereduce_reader", true);
   }
 
   // Phase zero senders and phase two replica sender require data to be received
@@ -1229,10 +1232,6 @@ int main(int argc, char** argv) {
 
   logStartTime();
 
-  // Parse peer list.
-  IPList peers;
-  parsePeerList(params, peers);
-
   // Parse disk lists from params.
   StringList intermediateDiskList;
   getDiskList(intermediateDiskList, "INTERMEDIATE_DISK_LIST", &params);
@@ -1241,64 +1240,85 @@ int main(int argc, char** argv) {
   StringList outputDiskList;
   getDiskList(outputDiskList, "OUTPUT_DISK_LIST", &params);
 
+  // Parse peer list.
+  IPList peers;
+  parsePeerList(params, peers);
+
   // Calculate additional params based on the existing parameter set
   deriveAdditionalParams(params, intermediateDiskList, outputDiskList);
 
   RecordFilterMap recordFilterMap(params);
 
-  limitMemorySize(params);
-
   KeyPartitionerInterface* keyPartitioner = NULL;
 
-  // Run phase zero.
-  PhaseZeroOutputData* outputData = executePhaseZero(
-    &params, peers, intermediateDiskList, recordFilterMap);
-  keyPartitioner = outputData->getKeyPartitioner();
+  dumpParams(params);
+
+  if (!params.get<bool>("SKIP_PHASE_ZERO")) {
+    PhaseZeroOutputData* outputData = executePhaseZero(
+      &params, peers, intermediateDiskList, recordFilterMap);
+    keyPartitioner = outputData->getKeyPartitioner();
+
+    delete outputData;
+  }
 
   if (keyPartitioner != NULL) {
     File keyPartitionerFile(params.get<std::string>("BOUNDARY_LIST_FILE"));
     keyPartitioner->writeToFile(keyPartitionerFile);
   }
 
-  // Node 0 should set the number of partitions
-  uint64_t localNodeID = params.get<uint64_t>("MYPEERID");
-  CoordinatorClientInterface* coordinatorClient =
-    CoordinatorClientFactory::newCoordinatorClient(params, "", "", 0);
+  if (!params.get<bool>("SKIP_PHASE_ONE")) {
+    // In the event that we skipped phase zero for a job we're going to need to
+    // fill in the partition count.
+    uint64_t localNodeID = params.get<uint64_t>("MYPEERID");
+    CoordinatorClientInterface* coordinatorClient =
+      CoordinatorClientFactory::newCoordinatorClient(params, "", "", 0);
 
-  std::list<uint64_t> jobIDList;
-  parseCommaDelimitedList< uint64_t, std::list<uint64_t> >(
-    jobIDList, params.get<std::string>("JOB_IDS"));
-  for (std::list<uint64_t>::iterator iter = jobIDList.begin();
-       iter != jobIDList.end(); iter++) {
-    JobInfo* jobInfo = coordinatorClient->getJobInfo(*iter);
-    if (jobInfo->numPartitions == 0) {
-      // Partition count not set for this job.
-      if (localNodeID == 0) {
-        // We are responsible for setting the partition count.
-        // Use user-defined Intermediate:Input ratio.
-        setNumPartitions(
-          jobInfo->jobID, params.get<double>("INTERMEDIATE_TO_INPUT_RATIO"),
-          params);
-      } else {
-        // Peer 0 should set this shortly, check every 100ms
-        do {
-          delete jobInfo;
-          usleep(100000);
-          jobInfo = coordinatorClient->getJobInfo(*iter);
-        } while (jobInfo->numPartitions == 0);
+    std::list<uint64_t> jobIDList;
+    parseCommaDelimitedList< uint64_t, std::list<uint64_t> >(
+      jobIDList, params.get<std::string>("JOB_IDS"));
+    for (std::list<uint64_t>::iterator iter = jobIDList.begin();
+         iter != jobIDList.end(); iter++) {
+      JobInfo* jobInfo = coordinatorClient->getJobInfo(*iter);
+      if (jobInfo->numPartitions == 0) {
+        // Partition count not set for this job.
+        if (localNodeID == 0) {
+          // We are responsible for setting the partition count.
+
+          // Use user-defined Intermediate:Input ratio.
+          setNumPartitions(
+            jobInfo->jobID, params.get<double>("INTERMEDIATE_TO_INPUT_RATIO"),
+            params);
+        } else {
+          // Peer 0 should set this shortly, check every 100ms
+          do {
+            delete jobInfo;
+            usleep(100000);
+            jobInfo = coordinatorClient->getJobInfo(*iter);
+          } while (jobInfo->numPartitions == 0);
+        }
       }
+      delete jobInfo;
     }
-    delete jobInfo;
+
+    delete coordinatorClient;
+
+    // Phase one uses SimpleMemoryAllocator, may try to allocate more memory
+    // than is available, so limit the memory usage to prevent the OOM killer
+    // from killing us.
+    limitMemorySize(params);
+
+    executePhaseOne(&params, intermediateDiskList, peers, recordFilterMap);
   }
 
-  delete coordinatorClient;
+  if (keyPartitioner != NULL) {
+    delete keyPartitioner;
+  }
 
-  // Run phase one
-  executePhaseOne(
-    &params, intermediateDiskList, peers, recordFilterMap);
+  if (!params.get<bool>("SKIP_PHASE_THREE")) {
+    limitMemorySize(params);
 
-  // Run phase three
-  executePhaseThree(&params, peers, intermediateDiskList, outputDiskList);
+    executePhaseThree(&params, peers, intermediateDiskList, outputDiskList);
+  }
 
   dumpParams(params);
 
